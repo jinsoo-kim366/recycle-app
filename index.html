@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>쓰레기 분류기</title>
+<style>
+  :root {
+    --bg: #f4f6f5; --card: #ffffff; --text: #1d2321; --muted: #6b7672; --border: #e1e6e3;
+    --plastic: #2f80ed; --can: #8e99a4; --paper: #c98a3c; --general: #4f4f4f; --nothing: #b9c2be;
+    --accent: #1f9d6b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #121614; --card: #1c2220; --text: #eef2f0; --muted: #9aa5a0; --border: #2c3532; --general: #a0a0a0; --nothing: #56605c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.3rem; margin: 4px 0 12px; }
+  .camera { position: relative; width: 100%; aspect-ratio: 1; background: #000; border-radius: 16px; overflow: hidden; }
+  .camera video { width: 100%; height: 100%; object-fit: cover; }
+  .camera .placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: #ccc; text-align: center; padding: 20px; }
+  .camera .guide { position: absolute; inset: 12%; border: 3px dashed rgba(255,255,255,.55); border-radius: 12px; pointer-events: none; display: none; }
+  .camera.on .guide { display: block; }
+  .controls { display: flex; gap: 8px; margin: 12px 0; }
+  button { flex: 1; padding: 14px; font-size: 1rem; font-weight: 600; border: 0; border-radius: 12px; cursor: pointer;
+    background: var(--accent); color: #fff; }
+  button.secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+  button:disabled { opacity: .5; cursor: default; }
+  .result { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px; text-align: center; margin-bottom: 12px; }
+  .result .icon { font-size: 3rem; line-height: 1; }
+  .result .label { font-size: 1.6rem; font-weight: 800; margin: 6px 0 2px; }
+  .result .tip { color: var(--muted); font-size: .95rem; }
+  .bars { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 14px 16px; }
+  .bar { display: grid; grid-template-columns: 70px 1fr 48px; align-items: center; gap: 8px; margin: 8px 0; font-size: .9rem; }
+  .track { height: 12px; background: var(--border); border-radius: 6px; overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 6px; transition: width .15s; }
+  .pct { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .status { color: var(--muted); font-size: .85rem; margin-top: 10px; text-align: center; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>♻️ 쓰레기 분류기</h1>
+
+  <div class="camera" id="camera">
+    <video id="video" playsinline muted></video>
+    <div class="placeholder" id="placeholder">'카메라 시작'을 누른 뒤<br>물건을 화면 가운데에 비춰 주세요</div>
+    <div class="guide"></div>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn">카메라 시작</button>
+    <button id="flipBtn" class="secondary" disabled>카메라 전환</button>
+  </div>
+
+  <div class="result" id="result">
+    <div class="icon" id="resIcon">📷</div>
+    <div class="label" id="resLabel">대기 중</div>
+    <div class="tip" id="resTip">모델을 불러오는 중...</div>
+  </div>
+
+  <div class="bars" id="bars"></div>
+  <div class="status" id="status"></div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8.5/dist/teachablemachine-image.min.js"></script>
+<script>
+  // ── 여기만 바꾼다 ──
+
+  // ① 모델 폴더 (my_model 폴더가 index.html 옆에 있으면 그대로)
+  const MODEL_URL = "./my_model/";
+
+  // ② 연결표 (2장 공책의 클래스 연결표 한 줄 = 코드 한 줄)
+  const GUIDE = {
+    plastic: { name: "플라스틱", icon: "🧴", text: "라벨을 떼고 플라스틱 통에 넣어요" },
+    can:     { name: "캔",       icon: "🥫", text: "내용물을 비우고 캔 통에 넣어요" },
+    paper:   { name: "종이",     icon: "📄", text: "테이프를 떼고 종이 통에 넣어요" },
+    general: { name: "일반쓰레기", icon: "🗑️", text: "일반쓰레기 봉투에 넣어요" },
+    nothing: { name: "",         icon: "📷", text: "카메라에 물건을 비춰 주세요" },
+  };
+
+  // ③ 기준값 (처음에는 0.8 그대로)
+  const THRESHOLD = 0.8;
+
+  // ── 여기만 바꾼다 ──
+
+  const SMOOTHING = 0.6;     // 이전 프레임 결과를 얼마나 유지할지 (0~1, 클수록 덜 깜빡임)
+  // 막대그래프 색 (연결표에 없는 클래스는 기본색)
+  const COLORS = { plastic: "var(--plastic)", can: "var(--can)", paper: "var(--paper)", general: "var(--general)", nothing: "var(--nothing)" };
+  const guideFor = (l) => GUIDE[l] || { name: l, icon: "❔", text: "" };
+
+  const $ = (id) => document.getElementById(id);
+  const video = $("video");
+  const crop = document.createElement("canvas");
+  crop.width = crop.height = 224;
+  const cropCtx = crop.getContext("2d");
+
+  let model, labels = [], stream = null, facing = "environment", running = false;
+  let smoothed = null;
+
+  async function loadModel() {
+    try {
+      model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+      labels = model.getClassLabels();
+      buildBars();
+      setResult(null);
+      $("resTip").textContent = "모델 준비 완료! 카메라를 시작하세요.";
+    } catch (e) {
+      console.error(e);
+      $("resLabel").textContent = "모델 로드 실패";
+      $("resTip").textContent = "index.html을 파일로 직접 열면 안 돼요. run.bat(로컬 서버)으로 실행해 주세요.";
+    }
+  }
+
+  function buildBars() {
+    $("bars").innerHTML = labels.map((l) => {
+      const name = guideFor(l).name || "없음";
+      return `<div class="bar"><span>${name}</span>
+        <div class="track"><div class="fill" id="fill-${l}" style="background:${COLORS[l] || "var(--accent)"}"></div></div>
+        <span class="pct" id="pct-${l}">0%</span></div>`;
+    }).join("");
+  }
+
+  async function startCamera() {
+    stopCamera();
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: facing }, width: { ideal: 640 }, height: { ideal: 640 } },
+        audio: false,
+      });
+    } catch (e) {
+      $("status").textContent = "카메라 권한이 필요해요: " + e.message;
+      return;
+    }
+    video.srcObject = stream;
+    video.style.transform = facing === "user" ? "scaleX(-1)" : "";
+    await video.play();
+    $("placeholder").style.display = "none";
+    $("camera").classList.add("on");
+    $("startBtn").textContent = "정지";
+    $("flipBtn").disabled = false;
+    running = true;
+    smoothed = null;
+    loop();
+  }
+
+  function stopCamera() {
+    running = false;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    $("camera").classList.remove("on");
+    $("placeholder").style.display = "";
+    $("startBtn").textContent = "카메라 시작";
+    $("flipBtn").disabled = true;
+  }
+
+  // 영상 가운데 정사각형을 224x224로 잘라 모델에 넣음 (Teachable Machine 학습 방식과 동일)
+  function grabFrame() {
+    const w = video.videoWidth, h = video.videoHeight, s = Math.min(w, h);
+    cropCtx.drawImage(video, (w - s) / 2, (h - s) / 2, s, s, 0, 0, 224, 224);
+    return crop;
+  }
+
+  async function loop() {
+    if (!running) return;
+    if (video.readyState >= 2 && model) {
+      const preds = await model.predict(grabFrame());
+      const probs = preds.map((p) => p.probability);
+      smoothed = smoothed ? smoothed.map((v, i) => v * SMOOTHING + probs[i] * (1 - SMOOTHING)) : probs;
+      render(smoothed);
+    }
+    requestAnimationFrame(loop);
+  }
+
+  function render(probs) {
+    labels.forEach((l, i) => {
+      const pct = Math.round(probs[i] * 100);
+      $("fill-" + l).style.width = pct + "%";
+      $("pct-" + l).textContent = pct + "%";
+    });
+    const best = probs.indexOf(Math.max(...probs));
+    setResult(probs[best] >= THRESHOLD ? labels[best] : "uncertain");
+  }
+
+  let lastShown;
+  function setResult(label) {
+    if (label === lastShown) return;
+    lastShown = label;
+    if (!label) {
+      $("resIcon").textContent = "📷"; $("resLabel").textContent = "대기 중"; $("resLabel").style.color = "";
+    } else if (label === "uncertain") {
+      $("resIcon").textContent = "🤔"; $("resLabel").textContent = "판별 중...";
+      $("resLabel").style.color = ""; $("resTip").textContent = "물건을 조금 더 가까이, 가운데에 비춰 주세요.";
+    } else {
+      const g = guideFor(label);
+      $("resIcon").textContent = g.icon; $("resLabel").textContent = g.name || " ";
+      $("resLabel").style.color = COLORS[label] && label !== "nothing" ? COLORS[label] : ""; $("resTip").textContent = g.text;
+    }
+  }
+
+  $("startBtn").onclick = () => (running ? stopCamera() : startCamera());
+  $("flipBtn").onclick = () => { facing = facing === "environment" ? "user" : "environment"; startCamera(); };
+
+  loadModel();
+</script>
+</body>
+</html>
